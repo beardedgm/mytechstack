@@ -32,6 +32,7 @@
 | Bot Protection | Cloudflare Turnstile | **Best** — invisible CAPTCHA alternative that doesn't degrade UX. Free tier is generous. Server-side verification is a single POST to Cloudflare. Applied to all public-facing forms: registration, login, password reset, and any app-specific submission forms. | — |
 | Security Headers | Helmet.js | **Best** — single middleware call sets all recommended HTTP security headers (X-Frame-Options, X-Content-Type-Options, Strict-Transport-Security, CSP, etc.). Zero configuration for the defaults, customizable when needed. | — |
 | CORS | cors (Express middleware) | **Best** — even with a single-service deployment (Express serves the SPA), CORS is a defense-in-depth layer that restricts which origins can call your API. Simple configuration, keeps your security posture tight if you ever split services later. | — |
+| Admin Role | Database role column | **Best** — `role` field on the User model with values `user` (default) and `owner`. Industry standard RBAC pattern used by every major framework. No redeploy to transfer ownership — update one document. Queryable, auditable, and scales naturally if you ever add a third role. The owner authenticates through the normal login flow like every other user. | — |
 
 ### Payments & Email
 
@@ -80,6 +81,7 @@ Before building any app, you maintain a single **template repository** that cont
 saas-boilerplate/
 ├── client/                     # React + Vite frontend
 │   ├── public/
+│   │   └── robots.txt
 │   ├── src/
 │   │   ├── api/                # TanStack Query hooks & Axios instance
 │   │   │   ├── axiosInstance.js
@@ -87,7 +89,7 @@ saas-boilerplate/
 │   │   │   └── useSubscription.js
 │   │   ├── components/
 │   │   │   ├── auth/           # Login, Register, ForgotPassword, ResetPassword
-│   │   │   ├── layout/         # Navbar, Footer, Sidebar, ProtectedRoute
+│   │   │   ├── layout/         # Navbar, Footer, Sidebar, ProtectedRoute, OwnerRoute
 │   │   │   ├── payments/       # PricingTable, SubscriptionStatus
 │   │   │   └── ui/             # Shared buttons, modals, inputs
 │   │   ├── pages/
@@ -96,7 +98,9 @@ saas-boilerplate/
 │   │   │   ├── Register.jsx
 │   │   │   ├── Dashboard.jsx
 │   │   │   ├── Settings.jsx
-│   │   │   └── Pricing.jsx
+│   │   │   ├── Pricing.jsx
+│   │   │   ├── NotFound.jsx        # 404 page
+│   │   │   └── admin/          # AdminDashboard, AdminUsers (owner-only)
 │   │   ├── store/              # Zustand stores
 │   │   │   └── useAuthStore.js
 │   │   ├── utils/
@@ -134,6 +138,7 @@ saas-boilerplate/
 │   │   ├── errorHandler.js     # Centralized error handler
 │   │   ├── requestLogger.js    # Pino HTTP request logging
 │   │   ├── requireAuth.js      # Session-based auth check
+│   │   ├── requireOwner.js     # Owner role check (user.role === 'owner')
 │   │   ├── requireSubscription.js  # Stripe subscription gate
 │   │   ├── csrfProtection.js   # X-header CSRF with constant-time comparison
 │   │   ├── rateLimiter.js      # MongoDB sliding window rate limiter
@@ -141,9 +146,11 @@ saas-boilerplate/
 │   ├── routes/
 │   │   ├── auth.js             # Register, login, logout, verify, reset
 │   │   ├── user.js             # Profile, settings, password change, export, delete
+│   │   ├── admin.js            # Owner-only admin endpoints
 │   │   ├── billing.js          # Stripe checkout session, portal, webhooks
 │   │   ├── email-webhooks.js   # Resend bounce/complaint webhook handler
 │   │   ├── files.js            # GridFS upload/download (delete if not needed)
+│   │   ├── sitemap.js          # Dynamic sitemap.xml generation
 │   │   └── health.js           # Health check endpoint for Render
 │   ├── services/
 │   │   ├── emailService.js     # Resend send helpers (checks bounce/suppress flags)
@@ -168,6 +175,8 @@ saas-boilerplate/
 │   ├── app.js                  # Express app setup + graceful shutdown
 │   └── package.json
 │
+├── scripts/
+│   └── promote-owner.js        # One-time CLI script to assign owner role
 ├── .github/
 │   ├── workflows/
 │   │   └── ci.yml              # CI pipeline (hard deploy gate)
@@ -354,6 +363,9 @@ SENTRY_DSN=
 # PostHog
 VITE_POSTHOG_KEY=
 VITE_POSTHOG_HOST=
+
+# Admin (optional — one-time seed, remove after first deploy)
+SEED_OWNER_EMAIL=
 ```
 
 ---
@@ -420,6 +432,9 @@ SENTRY_DSN=https://...@sentry.io/...
 # PostHog
 VITE_POSTHOG_KEY=phc_...
 VITE_POSTHOG_HOST=https://us.i.posthog.com
+
+# Admin (optional — one-time seed, remove after first deploy)
+SEED_OWNER_EMAIL=you@yourdomain.com
 ```
 
 ---
@@ -813,7 +828,16 @@ Check `emailBounced` and `emailSuppressed` flags before sending any email. Never
     <Route element={<SubscriptionGate />}>
       <Route path="/app/*" element={<AppFeatures />} />
     </Route>
+
+    {/* Protected — requires owner role */}
+    <Route element={<OwnerRoute />}>
+      <Route path="/admin" element={<AdminDashboard />} />
+      <Route path="/admin/users" element={<AdminUsers />} />
+    </Route>
   </Route>
+
+  {/* 404 — must be last */}
+  <Route path="*" element={<NotFound />} />
 </Routes>
 ```
 
@@ -861,6 +885,77 @@ Landing Page
 
 Build this once in the template. Swap copy and images per app.
 
+### 6.5 — 404 Page
+
+```javascript
+// src/pages/NotFound.jsx
+export default function NotFound() {
+  return (
+    <div>
+      <h1>404</h1>
+      <p>The page you're looking for doesn't exist.</p>
+      <a href="/">Go home</a>
+    </div>
+  );
+}
+```
+
+Keep it simple. Include a link back to the landing page. Match the app's visual style. The `<Route path="*">` catch-all in `App.jsx` handles any URL that doesn't match a defined route.
+
+### 6.6 — robots.txt
+
+```
+// client/public/robots.txt
+User-agent: *
+Allow: /
+Disallow: /dashboard
+Disallow: /settings
+Disallow: /admin
+Disallow: /app
+
+Sitemap: https://yourdomain.com/sitemap.xml
+```
+
+Lives in `client/public/` so Vite includes it in the build output. Tells search engines to index your public pages (landing, pricing, legal) but not authenticated pages (dashboard, settings, admin, app features). Update the domain per project.
+
+### 6.7 — sitemap.xml
+
+```javascript
+// server/routes/sitemap.js
+import { Router } from 'express';
+
+const router = Router();
+
+router.get('/sitemap.xml', (req, res) => {
+  const baseUrl = process.env.APP_URL;
+
+  const routes = [
+    { path: '/', priority: '1.0', changefreq: 'weekly' },
+    { path: '/pricing', priority: '0.8', changefreq: 'monthly' },
+    { path: '/login', priority: '0.3', changefreq: 'yearly' },
+    { path: '/register', priority: '0.3', changefreq: 'yearly' },
+    { path: '/terms', priority: '0.2', changefreq: 'yearly' },
+    { path: '/privacy', priority: '0.2', changefreq: 'yearly' },
+  ];
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${routes.map(r => `  <url>
+    <loc>${baseUrl}${r.path}</loc>
+    <changefreq>${r.changefreq}</changefreq>
+    <priority>${r.priority}</priority>
+  </url>`).join('\n')}
+</urlset>`;
+
+  res.set('Content-Type', 'application/xml');
+  res.send(xml);
+});
+
+export default router;
+```
+
+Generated dynamically by Express so it always reflects your actual public routes. Only include pages you want search engines to index — never authenticated routes. Mount this route **before** the SPA catch-all in `app.js`.
+
 ---
 
 ## Phase 7: Deployment on Render
@@ -894,6 +989,8 @@ services:
         sync: false
       - key: SENTRY_DSN
         sync: false
+      - key: SEED_OWNER_EMAIL
+        sync: false  # Optional — remove after first deploy
 ```
 
 ### 7.2 — Express Serves the SPA
@@ -1609,10 +1706,12 @@ router.post('/register', validate(registerSchema), asyncHandler(async (req, res)
 // 2. Middleware (session, helmet, cors, json parser)
 // 3. Stripe webhook route (needs raw body — BEFORE express.json())
 // 4. express.json() for all other routes
-// 5. API routes
-// 6. SPA catch-all (serves React build)
-// 7. Sentry error handler
-// 8. Custom errorHandler (last)
+// 5. API routes (auth, user, billing)
+// 6. Admin routes (/api/admin/* — requireAuth + requireOwner baked into router)
+// 7. Sitemap route (/sitemap.xml — before SPA catch-all)
+// 8. SPA catch-all (serves React build)
+// 9. Sentry error handler
+// 10. Custom errorHandler (last)
 ```
 
 ---
@@ -1939,6 +2038,267 @@ router.delete('/api/user/account', requireAuth, asyncHandler(async (req, res) =>
 
 ---
 
+## Phase 21: Owner Role (Admin Access)
+
+Two roles: `user` and `owner`. The role is stored as a field on the User document in MongoDB. This is the industry-standard RBAC pattern — the same approach used by Django, Rails, Laravel, and every major framework.
+
+### 21.1 — How It Works
+
+```
+User signs up → normal registration flow → role defaults to "user"
+You promote a user to owner via a one-time CLI script or Atlas query
+On every admin request:
+├── requireAuth checks session (is this person logged in?)
+├── requireOwner checks role === 'owner' on the user document
+├── Both pass → admin access granted
+└── Either fails → 403 Forbidden
+
+Transfer ownership:
+├── Set new user's role to 'owner'
+├── Set old user's role back to 'user'
+└── Takes effect immediately — no redeploy needed
+```
+
+### 21.2 — User Model
+
+```javascript
+// server/models/User.js
+const userSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password: { type: String, required: true },
+  name: { type: String, required: true, trim: true },
+  role: { type: String, enum: ['user', 'owner'], default: 'user' },
+  emailVerified: { type: Boolean, default: false },
+  stripeCustomerId: { type: String, sparse: true, index: true },
+  subscriptionStatus: { type: String, default: 'inactive' },
+  emailBounced: { type: Boolean, default: false },
+  emailSuppressed: { type: Boolean, default: false },
+  // ... app-specific fields
+}, { timestamps: true });
+```
+
+### 21.3 — Owner Middleware
+
+```javascript
+// server/middleware/requireOwner.js
+export function requireOwner(req, res, next) {
+  if (req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
+```
+
+Stack it after `requireAuth` on every admin route. The owner must be fully authenticated through the normal login flow — Turnstile, rate limiting, session, everything. The role only determines *what* an authenticated user can do.
+
+### 21.4 — Promoting the First Owner
+
+You need a way to make the first user an owner. Three options, all valid:
+
+**Option A — One-time CLI script (recommended):**
+
+```javascript
+// scripts/promote-owner.js
+import mongoose from 'mongoose';
+import User from '../server/models/User.js';
+import 'dotenv/config';
+
+const email = process.argv[2];
+if (!email) {
+  console.error('Usage: node scripts/promote-owner.js user@example.com');
+  process.exit(1);
+}
+
+await mongoose.connect(process.env.MONGODB_URI);
+const user = await User.findOneAndUpdate(
+  { email },
+  { role: 'owner' },
+  { new: true }
+);
+
+if (!user) {
+  console.error(`No user found with email: ${email}`);
+} else {
+  console.log(`Promoted ${user.email} to owner`);
+}
+
+await mongoose.connection.close();
+```
+
+Run it once after deploying: `node scripts/promote-owner.js you@yourdomain.com`
+
+**Option B — Atlas UI:** Open your Atlas cluster, find the user document, set `role: "owner"`. Quick and simple.
+
+**Option C — Seed on startup (for the template repo):**
+
+```javascript
+// server/config/seed.js
+import User from '../models/User.js';
+import logger from './logger.js';
+
+export async function seedOwner() {
+  const ownerEmail = process.env.SEED_OWNER_EMAIL;
+  if (!ownerEmail) return;
+
+  const updated = await User.findOneAndUpdate(
+    { email: ownerEmail },
+    { role: 'owner' },
+    { new: true }
+  );
+
+  if (updated) {
+    logger.info(`Owner role assigned to ${ownerEmail}`);
+  }
+
+  // Clear the env var purpose — it's a one-time seed, not a permanent config
+}
+```
+
+This uses an optional `SEED_OWNER_EMAIL` env var to promote a user on the first deploy. Remove the env var after the seed runs. The database is the source of truth from that point forward.
+
+### 21.5 — Admin Routes
+
+```javascript
+// server/routes/admin.js
+import { Router } from 'express';
+import { requireAuth } from '../middleware/requireAuth.js';
+import { requireOwner } from '../middleware/requireOwner.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
+import logger from '../config/logger.js';
+import User from '../models/User.js';
+
+const router = Router();
+
+// All admin routes require auth + owner role
+router.use(requireAuth);
+router.use(requireOwner);
+
+// Log every admin action
+router.use((req, res, next) => {
+  logger.info({
+    adminAction: true,
+    owner: req.user.email,
+    method: req.method,
+    url: req.originalUrl,
+  });
+  next();
+});
+
+// List all users
+router.get('/users', asyncHandler(async (req, res) => {
+  const users = await User.find()
+    .select('-password')
+    .sort({ createdAt: -1 })
+    .lean();
+  res.json(users);
+}));
+
+// View a specific user's details
+router.get('/users/:id', asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id).select('-password').lean();
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(user);
+}));
+
+// Get app-wide stats (total users, active subscriptions)
+router.get('/stats', asyncHandler(async (req, res) => {
+  const [totalUsers, activeSubscriptions] = await Promise.all([
+    User.countDocuments(),
+    User.countDocuments({ subscriptionStatus: 'active' }),
+  ]);
+  res.json({ totalUsers, activeSubscriptions });
+}));
+
+// Transfer ownership to another user
+router.post('/transfer-ownership/:id', asyncHandler(async (req, res) => {
+  const newOwner = await User.findById(req.params.id);
+  if (!newOwner) return res.status(404).json({ error: 'User not found' });
+
+  // Demote current owner, promote new owner
+  await User.findByIdAndUpdate(req.user._id, { role: 'user' });
+  await User.findByIdAndUpdate(newOwner._id, { role: 'owner' });
+
+  logger.info({
+    adminAction: true,
+    type: 'ownership_transfer',
+    from: req.user.email,
+    to: newOwner.email,
+  });
+
+  // Destroy current session — former owner must re-login as regular user
+  req.session.destroy();
+  res.json({ message: `Ownership transferred to ${newOwner.email}` });
+}));
+
+export default router;
+```
+
+### 21.6 — Expose Role to the Frontend
+
+```javascript
+// server/routes/user.js — in the "get current user" endpoint
+router.get('/api/user/me', requireAuth, asyncHandler(async (req, res) => {
+  const user = await User.findById(req.session.userId).select('-password').lean();
+  res.json({
+    ...user,
+    isOwner: user.role === 'owner',
+  });
+}));
+```
+
+### 21.7 — Frontend Admin Gate
+
+```javascript
+// src/components/layout/OwnerRoute.jsx
+import { Navigate, Outlet } from 'react-router-dom';
+import { useAuth } from '../../api/useAuth';
+
+export default function OwnerRoute() {
+  const { data: user, isLoading } = useAuth();
+
+  if (isLoading) return null;
+  if (!user?.isOwner) return <Navigate to="/dashboard" />;
+
+  return <Outlet />;
+}
+```
+
+```javascript
+// src/App.jsx — admin routes inside ProtectedRoute
+<Route element={<OwnerRoute />}>
+  <Route path="/admin" element={<AdminDashboard />} />
+  <Route path="/admin/users" element={<AdminUsers />} />
+</Route>
+```
+
+### 21.8 — What the Owner Can Do
+
+```
+Owner-only capabilities:
+├── View all registered users and their subscription status
+├── View app-wide stats (total users, active subscriptions)
+├── View a specific user's account details (for support)
+├── Transfer ownership to another registered user
+├── Access admin dashboard at /admin
+└── Any app-specific admin features you add per project
+
+What the owner CANNOT bypass:
+├── Normal login flow (Turnstile, rate limiting, lockout)
+├── Session-based auth (no special session, no backdoor)
+├── Password requirements (same rules as every user)
+└── CSRF protection (same for all requests)
+```
+
+### 21.9 — Security Rules
+
+1. **Never bypass auth.** The owner logs in like everyone else. The `role` field only controls authorization, never authentication.
+2. **Log everything.** Every admin action goes through pino with `adminAction: true` so you can filter and audit.
+3. **Admin routes are a separate router.** Mounted at `/api/admin/*`, isolated from user routes. The `requireOwner` middleware runs on every request in the router, not per-route (so you can't accidentally forget it).
+4. **The database is the single source of truth.** The role lives in the User document. No env vars, no config files, no second source.
+5. **Ownership transfer is logged and destroys the former owner's session.** This prevents the former owner from continuing to make admin requests on a stale session.
+
+---
+
 ## Launch Checklist
 
 This is the final gate before every app goes live.
@@ -1979,6 +2339,12 @@ This is the final gate before every app goes live.
 - [ ] Unverified emails cannot log in
 - [ ] Account deletion removes all user data and cancels Stripe subscription
 - [ ] Data export downloads complete JSON of user data
+- [ ] Owner user promoted via CLI script or Atlas (role: 'owner' in database)
+- [ ] Owner can access `/admin` routes after normal login
+- [ ] Non-owner users get 403 on `/api/admin/*` endpoints
+- [ ] `isOwner` flag returned from `/api/user/me` only for users with role 'owner'
+- [ ] Admin actions logged with `adminAction: true` in pino
+- [ ] Ownership transfer endpoint works and destroys former owner's session
 
 ### Payments
 
@@ -2012,6 +2378,10 @@ This is the final gate before every app goes live.
 - [ ] Graceful shutdown handles SIGTERM (in-flight requests complete before exit)
 - [ ] Structured logging active (pino in production, pino-pretty in dev)
 - [ ] Request logging middleware active (excluding health checks)
+- [ ] 404 page renders for unknown routes
+- [ ] `robots.txt` accessible and blocks authenticated routes
+- [ ] `sitemap.xml` accessible and lists only public pages
+- [ ] `sitemap.xml` domain matches production URL
 
 ### Database
 
@@ -2054,6 +2424,12 @@ This is the final gate before every app goes live.
 - [ ] Reset password
 - [ ] Log in with new password
 - [ ] Export account data
+- [ ] Promote your account to owner — verify admin dashboard accessible
+- [ ] Verify non-owner account cannot access /admin
+- [ ] Transfer ownership via admin endpoint — verify new owner has access, old owner does not
+- [ ] Visit a nonexistent URL — verify 404 page renders
+- [ ] Visit /robots.txt — verify it's accessible
+- [ ] Visit /sitemap.xml — verify it lists public pages with correct domain
 - [ ] Delete account — verify all data removed
 
 ---
@@ -2071,10 +2447,11 @@ This is the final gate before every app goes live.
 8.  README      → Update README.md with app name, description, and specifics
 9.  Test        → Write tests for new features, run full test suite (hard gate)
 10. Render      → Deploy via Blueprint, set env vars, configure domain
-11. Stripe      → Point webhook to production API URL, switch to live keys
-12. Sentry      → Create new project, add DSN to env vars
-13. PostHog     → Create new project, add API key to env vars
-14. Dependabot  → Verify enabled on new repo
-15. Legal       → Generate/customize ToS + Privacy Policy
-16. Launch      → Run the launch checklist above
+11. Owner       → Register your account, promote to owner via CLI script or Atlas
+12. Stripe      → Point webhook to production API URL, switch to live keys
+13. Sentry      → Create new project, add DSN to env vars
+14. PostHog     → Create new project, add API key to env vars
+15. Dependabot  → Verify enabled on new repo
+16. Legal       → Generate/customize ToS + Privacy Policy
+17. Launch      → Run the launch checklist above
 ```
